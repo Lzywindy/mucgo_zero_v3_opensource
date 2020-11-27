@@ -1,6 +1,6 @@
 # mucgo_zero_v3_opensource
 
-一个自带CNTK2.7的开源算法对比专用围棋程序
+一个开源算法对比专用围棋程序
 
 需要的环境是.Net Framework 4.8， CNTK2.7 , CUDA11，Math.Net
 
