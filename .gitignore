@@ -29,3 +29,12 @@
 *.scc
 *.cache
 packages
+*.json
+*.xml
+*.lib
+*.rar
+*.ide*
+*db*
+*ipch*
+*lnk*
+obj
