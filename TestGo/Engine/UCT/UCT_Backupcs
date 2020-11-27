@@ -1,0 +1,1534 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+/// <summary>
+/// 这个是UCT+Q-Learning+Sarsa的搜索、强化学习过程
+/// 模拟规则采用交替对手学习训练
+/// UCT搜索树分为以下几个步骤
+/// 1、选择（Sarsa作用，走一步然后值回传）
+/// 2、扩展（Sarsa作用，走一步然后值回传）
+/// 3、模拟（Sarsa作用，走一步然后值回传）
+/// 4、值回传（Q-Learning作用，走完全程，值回传）
+/// </summary>
+namespace MUCGO_zero_CS
+{
+    using static Math;
+    using static Stone;
+    using static SEARCH_MODE;
+    using static ConstValues;
+    using static Board;
+    using static Utils;
+    using System.Security.Cryptography;
+    using System.Threading;
+    /// <summary>
+    /// UCT搜索树的索引（可以序列化）
+    /// </summary>
+    [Serializable]
+    public class IndexUCT : IEqualityComparer<IndexUCT>, IEquatable<IndexUCT>
+    {
+        /// <summary>
+        /// 内部Hash值存储
+        /// </summary>
+        private byte[] hashData;
+        /// <summary>
+        /// 用于比较的Hash值（32位）
+        /// </summary>
+        private int HashInt32;
+        /// <summary>
+        /// 该UCT索引类的构造函数
+        /// </summary>
+        /// <param name="hashData">这个节点的Hash值</param>
+        public IndexUCT(byte[] hashData)
+        {
+            this.hashData = hashData;
+            var MD5Code = new MD5CryptoServiceProvider();
+            var tmpBytes = MD5Code.ComputeHash(hashData);
+            HashInt32 = 0;
+            for (int i = 0; i < tmpBytes.Length / sizeof(int); i++)
+                HashInt32 ^= BitConverter.ToInt32(tmpBytes, i * sizeof(int));
+        }
+        /// <summary>
+        /// 非显示转换
+        /// </summary>
+        /// <param name="hashData">内容</param>
+        public static implicit operator IndexUCT(byte[] hashData)
+        {
+            return new IndexUCT(hashData);
+        }
+        /// <summary>
+        /// 比较是否相等
+        /// </summary>
+        /// <param name="other"></param>
+        /// <returns></returns>
+        public bool Equals(IndexUCT other)
+        {
+            return CompareByteArray(hashData, other.hashData);
+        }
+        /// <summary>
+        /// 比较是否相等
+        /// </summary>
+        /// <param name="x"></param>
+        /// <param name="y"></param>
+        /// <returns></returns>
+        public bool Equals(IndexUCT x, IndexUCT y)
+        {
+            return CompareByteArray(x.hashData, y.hashData);
+        }
+        /// <summary>
+        /// 得到Hash值
+        /// </summary>
+        /// <param name="obj"></param>
+        /// <returns></returns>
+        public int GetHashCode(IndexUCT obj)
+        {
+            return obj.HashInt32;
+        }
+    }
+    /// <summary>
+    /// UCT搜索树节点（可以序列化）
+    /// </summary>
+    [Serializable]
+    public class TreeNode : IUCTNodeDNN
+    {
+        #region 节点状态
+        public readonly int BoardSize;
+        public readonly int Moves;
+        public readonly sbyte CurrentPlayer;
+        public readonly sbyte[] CurrentBoard;
+        public readonly byte[] EnabledPos;
+        public readonly byte[] SHA256HASH;
+        public readonly float Score_Board;
+        #endregion
+        #region 节点参数
+        volatile bool evaluated;
+        public volatile float V;
+        public volatile float N;
+        public readonly float[] P;
+        public readonly float[] Q;
+        public readonly float[] U;
+        public readonly int[] N_Next;
+        public readonly int[] W_Next;
+        #endregion
+        #region 基本操作
+        /// <summary>
+        /// 节点构造函数
+        /// </summary>
+        /// <param name="board">棋盘</param>
+        public TreeNode(IBoardUCT board)
+        {
+            BoardSize = board.BoardSize;
+            Moves = board.Moves;
+            CurrentPlayer = board.CurrentPlayer;
+            CurrentBoard = board.CurrentBoard;
+            EnabledPos = board.EnabledPos;
+            SHA256HASH = board.SHA256HASH;
+            evaluated = false;
+            V = 0;
+            N = 1;
+            P = new float[BoardSize + 1];
+            Q = new float[BoardSize + 1];
+            U = new float[BoardSize + 1];
+            N_Next = new int[BoardSize + 1];
+            W_Next = new int[BoardSize + 1];
+        }
+        #endregion
+        #region 深度神经网络和UCT节点的接口实现
+        /// <summary>
+        /// 是否被NN估值
+        /// </summary>
+        public bool Evaled { get { return evaluated; } set { evaluated = value; } }
+        /// <summary>
+        /// 可选动作的数目（最后一个代表PASS）
+        /// </summary>
+        public int ActionsLength { get { return BoardSize + 1; } }
+        /// <summary>
+        /// 得到当前棋盘的状态
+        /// </summary>
+        /// <returns></returns>
+        public IList<float> GetBoardState()
+        {
+            lock (this)
+            {
+                List<float> States = new List<float>(CurrentBoard.Length + EnabledPos.Length);
+                States.AddRange(Array.ConvertAll<sbyte, float>(CurrentBoard, (sbyte item) => { return item; }));
+                States.AddRange(Array.ConvertAll<byte, float>(EnabledPos, (byte item) => { return item; }));
+                return States;
+            }
+        }
+        /// <summary>
+        /// 回写NN对节点的估值
+        /// </summary>
+        /// <param name="Policy"></param>
+        /// <param name="Value"></param>
+        public void Writeback(IList<float> Policy, IList<float> Value)
+        {
+            lock (this)
+            {
+                Array.Copy(Policy.ToArray(), P, ActionsLength);
+                V = Value[0];
+            }
+        }
+        /// <summary>
+        /// 得到Pie值（训练时，拿给神经网络）
+        /// </summary>
+        /// <returns></returns>
+        public IList<float> GetPieData()
+        {
+            lock (this)
+            {
+                return new List<float>(Q);
+            }
+            ;
+        }
+        /// <summary>
+        /// 得到Z值（训练时，拿给神经网络）
+        /// </summary>
+        /// <param name="winner"></param>
+        /// <returns></returns>
+        public IList<float> GetZData(float winner)
+        {
+            lock (this)
+            {
+                var Z = new List<float>();
+                Z.Add(winner * CurrentPlayer);
+                return Z;
+            }
+        }
+        #endregion
+        #region 计算与更新
+        /// <summary>
+        /// 更新Q表
+        /// </summary>
+        /// <param name="Data"></param>
+        /// <param name="LearningRate"></param>
+        /// <param name="pos"></param>
+        public void UpdateQ(float Data, float LearningRate, int pos, float gamma)
+        {
+            gamma = Min(1, Max(-1, gamma));
+            if (pos >= 0 && pos < ActionsLength && LearningRate > 0 && LearningRate < 1)
+                Q[pos] = Q[pos] + gamma * (Q[pos] + LearningRate * Data);
+        }
+        /// <summary>
+        /// 更新UCB值的函数（所有不为0的数均是可选择的点）
+        /// </summary>
+        /// <param name="Cpuct"></param>
+        /// <param name="NewFunc"></param>
+        public void UpdateU(float Cpuct, bool NewFunc = false, bool CanResigned = false)
+        {
+            lock (this)
+            {
+                if (!NewFunc)
+                {
+                    Parallel.For(0, ActionsLength, (int index) =>
+                    {
+                        U[index] = (N > 1 ? (Cpuct * Q[index] * (float)Sqrt(2 * N / (N_Next[index] + 1.0f))) : P[index]);
+                    });
+                }
+                else
+                {
+                    Parallel.For(0, ActionsLength, (int index) =>
+                    {
+                        U[index] = (N > 1 ? Cpuct * (float)Sqrt(2 * N / (N_Next[index] + 1.0f)) : P[index]);
+                    });
+                }
+                float min_u_data = U.Min();
+                if (min_u_data < 0)
+                    min_u_data = 1 - min_u_data;
+                Parallel.For(0, ActionsLength, (int index) =>
+                {
+                    U[index] = (U[index] + min_u_data) * ((index < ActionsLength - 1) ? EnabledPos[index] : CanResigned ? 1 : 0);
+                });
+            }
+        }
+        /// <summary>
+        /// 访问函数（每一次加1）
+        /// </summary>
+        public void Visit()
+        {
+            N++;
+        }
+        /// <summary>
+        /// 得到可落子的顶点
+        /// </summary>
+        /// <returns></returns>
+        public int[] GetAvaliablePos()
+        {
+            List<int> posArray = new List<int>();
+            for (int i = 0; i < EnabledPos.Length; i++)
+            {
+                if (EnabledPos[i] == 1)
+                    posArray.Add(i);
+            }
+            return posArray.ToArray();
+        }
+        #endregion
+    }
+    /// <summary>
+    /// 盘面节点信息
+    /// </summary>
+    class NodeData : IEqualityComparer<NodeData>, IEquatable<NodeData>
+    {
+        public readonly int BoardSize;
+        public readonly int Moves;
+        public readonly sbyte CurrentPlayer;
+        public readonly sbyte[] CurrentBoard;
+        public readonly byte[] EnabledPos;
+        public readonly byte[] SHA256HASH;
+        public readonly float Score_Board;
+        public readonly int LastestPos;
+        public NodeData(IBoardUCT game)
+        {
+            BoardSize = game.BoardSize;
+            Moves = game.Moves;
+            CurrentPlayer = game.CurrentPlayer;
+            CurrentBoard = game.CurrentBoard;
+            EnabledPos = game.EnabledPos;
+            SHA256HASH = game.SHA256HASH;
+            LastestPos = game.LastestPos;
+            Score_Board = game.Score_UCT * CurrentPlayer;
+        }
+        /// <summary>
+        /// 判断两结构体是否一致
+        /// </summary>
+        /// <param name="x"></param>
+        /// <param name="y"></param>
+        /// <returns></returns>
+        public bool Equals(NodeData x, NodeData y)
+        {
+            return CompareByteArray(x.SHA256HASH, y.SHA256HASH);
+        }
+        /// <summary>
+        /// 得到这个结构体的哈希值
+        /// </summary>
+        /// <param name="obj"></param>
+        /// <returns></returns>
+        public int GetHashCode(NodeData obj)
+        {
+            var MD5Code = new MD5CryptoServiceProvider();
+            var tmpBytes = MD5Code.ComputeHash(SHA256HASH);
+            int HashCode = 0;
+            for (int i = 0; i < tmpBytes.Length / sizeof(int); i++)
+                HashCode ^= BitConverter.ToInt32(tmpBytes, i * sizeof(int));
+            return HashCode;
+        }
+        /// <summary>
+        /// 判断和其他结构体是否相等
+        /// </summary>
+        /// <param name="other">其他同类结构体</param>
+        /// <returns>是否相等</returns>
+        public bool Equals(NodeData other)
+        {
+            return CompareByteArray(SHA256HASH, other.SHA256HASH);
+        }
+        /// <summary>
+        /// 得到当前棋盘的状态
+        /// </summary>
+        /// <returns></returns>
+        public IList<float> GetBoardState()
+        {
+            List<float> States = new List<float>(CurrentBoard.Length + EnabledPos.Length);
+            States.AddRange(Array.ConvertAll<sbyte, float>(CurrentBoard, (sbyte item) => { return item; }));
+            States.AddRange(Array.ConvertAll<byte, float>(EnabledPos, (byte item) => { return item; }));
+            return States;
+        }
+    }
+    /// <summary>
+    /// 搜索树节点信息
+    /// </summary>
+    class UCTNode
+    {
+        /// <summary>
+        /// 终节点(叶子节点)反向回传的胜利值
+        /// </summary>
+        public volatile int WinnerCount = 0;
+        /// <summary>
+        /// 每一次前向访问该节点，都会使值+1
+        /// </summary>
+        public volatile int visit_count = 1;
+        /// <summary>
+        /// 下一个动作的胜负值累积
+        /// </summary>
+        public readonly int[] value_win_node = new int[PURE_BOARD_MAX + 1];
+        /*下一个动作的访问次数*/
+        public readonly int[] visit_count_node = new int[PURE_BOARD_MAX + 1];
+        /*依据经验得到的概率*/
+        public readonly float[] P = new float[PURE_BOARD_MAX + 1];
+        public readonly float[] UCB = new float[PURE_BOARD_MAX + 1];
+        /*价值累积和*/
+        public volatile float W = 0;
+        /*依据经验得到的价值*/
+        public volatile float V = 0;
+        /*是否用经验估算过*/
+        public volatile bool Evaled = false;
+        /*当前盘面比分*/
+        public volatile float CurrentScore = 0;
+        public void ReLUSoomthP()
+        {
+            lock (P)
+            {
+                float sum = 0;
+                for (var i = 0; i < P.Length; i++)
+                    P[i] += Max(sum, 0.0f);
+                sum = (sum > 0 ? sum : 1);
+                for (var i = 0; i < P.Length; i++)
+                    P[i] = P[i] / sum;
+            }
+        }
+        public UCTNode()
+        {
+            Reset();
+        }
+        public UCTNode(UCTNode _UCT_Node)
+        {
+            WinnerCount = _UCT_Node.WinnerCount;
+            visit_count = _UCT_Node.visit_count;
+            V = _UCT_Node.V;
+            W = _UCT_Node.W;
+            CurrentScore = _UCT_Node.CurrentScore;
+            Evaled = _UCT_Node.Evaled;
+            Array.Copy(_UCT_Node.value_win_node, value_win_node, value_win_node.Length);
+            Array.Copy(_UCT_Node.visit_count_node, visit_count_node, visit_count_node.Length);
+            Array.Copy(_UCT_Node.P, P, P.Length);
+        }
+        /*重置节点*/
+        public void Reset()
+        {
+            WinnerCount = 0;
+            visit_count = 1;
+            V = 0;
+            W = 0;
+            CurrentScore = 0;
+            Evaled = false;
+            Array.Clear(value_win_node, 0, value_win_node.Length);
+            Array.Clear(visit_count_node, 0, visit_count_node.Length);
+            for (int i = 0; i < P.Length; i++)
+                P[i] = 1 / P.Length;
+        }
+        /*初始化节点*/
+        public void InitNode()
+        {
+            WinnerCount = 0;
+            visit_count = 1;
+        }
+        /// <summary>
+        /// 节点的线性叠加
+        /// </summary>
+        /// <param name="node">其他Hash值一致的节点</param>
+        public void LinerAddOn(UCTNode node)
+        {
+            WinnerCount += node.WinnerCount;
+            visit_count += node.visit_count;
+            for (var i = 0; i <= PURE_BOARD_MAX; i++)
+            {
+                lock (value_win_node) value_win_node[i] += node.value_win_node[i];
+                lock (visit_count_node) visit_count_node[i] += node.visit_count_node[i];
+            }
+        }
+        /// <summary>
+        /// 依据禁着点更新自己的概率
+        /// </summary>
+        /// <param name="forbidpos">禁着点</param>
+        public void Update(byte[] forbidpos = null, float E_gready = 0.1f)
+        {
+            lock (P)
+            {
+                if (forbidpos == null || forbidpos.Length != PURE_BOARD_MAX) return;
+                float sum = 0;
+                for (int i = 0; i <= PURE_BOARD_MAX; i++)
+                {
+                    P[i] = Max((i < PURE_BOARD_MAX && (forbidpos[i] == 0)) ? 0 : P[i] + E_gready * visit_count_node[i] / ((float)visit_count == 0 ? 1.0f : visit_count), 0);
+                    sum += Max(P[i], 0);
+                }
+                sum = sum == 0 ? 1 : sum;
+                for (int i = 0; i <= PURE_BOARD_MAX; i++)
+                    P[i] = P[i] / sum;
+                //V = (V + E_gready * value_win / (visit_count == 0 ? 1 : visit_count)) / (1 + E_gready);
+            }
+            V = WinnerCount / (float)visit_count;
+        }
+        /// <summary>
+        /// QLearning更新策略
+        /// </summary>
+        /// <param name="NextPsa">下一个状态的P(s,a)</param>
+        /// <param name="action">当前执行的动作</param>
+        /// <param name="Winner">最后的胜利者</param>
+        public void Update_QLearning(float[] NextPsa, int action, float Winner)
+        {
+            lock (P)
+            {
+                P[action] = P[action] + epsional_qlearning * (Winner + (1 - gamma) * NextPsa.Max());
+            }
+        }
+        /// <summary>
+        /// Sarsa更新策略
+        /// </summary>
+        /// <param name="NextPsa">下一个状态的P(s,a)</param>
+        /// <param name="action">当前执行的动作</param>
+        /// <param name="next_action">下一个状态执行的动作</param>
+        /// <param name="Reward">这一步到下一步的奖励</param>
+        public void Update_Sarsa(float[] NextPsa, int action, int next_action, float Reward)
+        {
+            lock (P)
+            {
+                P[action] = P[action] + epsional_qlearning * (Reward + gamma * NextPsa[next_action]);
+            }
+        }
+        /// <summary>
+        /// 使P归一化
+        /// </summary>
+        public void UpdateNormalizedP()
+        {
+            ReLUSoomthP();
+        }
+        /// <summary>
+        /// 获得搜索后的经验值
+        /// </summary>
+        /// <param name="Pie">UCT搜索树搜出的结果策略</param>
+        /// <param name="Z">UCT搜索树搜出的结果价值</param>
+        public void GetExp(out List<float> Pie, out List<float> Z)
+        {
+            Pie = new List<float>(new float[PURE_BOARD_MAX]);
+            Z = new List<float>(new float[1] { V });
+            lock (P)
+            {
+                for (int i = 0; i < PURE_BOARD_MAX; i++)
+                {
+                    Pie[i] = P[i];
+                }
+            }
+        }
+        /// <summary>
+        /// 提升（降低）下次走子某个位置概率
+        /// </summary>
+        /// <param name="pos"></param>
+        /// <param name="value"></param>
+        /// <param name="forbidpos"></param>
+        public void SetAdvantagePos(int pos, float value, bool[] forbidpos = null)
+        {
+            if (forbidpos == null || forbidpos.Length != PURE_BOARD_MAX) return;
+            lock (P)
+            {
+                var ppos = GetPureBoardPos(pos);
+                P[ppos] += forbidpos[ppos] ? value : 0;
+            }
+        }
+    };
+    /// <summary>
+    /// UCT搜索树存储空间
+    /// </summary>
+    class UCTStorge
+    {
+        protected readonly Dictionary<IndexUCT, UCTNode> DataSet;
+        protected int MaxiumNodes = 0;
+        protected int WorkerCount = 12;
+        /// <summary>
+        /// 搜索树存储的构造函数
+        /// </summary>
+        /// <param name="depth">默认搜索深度</param>
+        public UCTStorge(int depth = 422)
+        {
+            MaxiumNodes = 0;
+            for (int i = 0; i < depth; i++)
+            {
+                var value = (int)(pure_board_max * Sqrt(2 * Log((i + 1.0f))) + 1.0f);
+                MaxiumNodes += value;
+            }
+            DataSet = new Dictionary<IndexUCT, UCTNode>((int)(MaxiumNodes * 1.5));
+        }
+        /// <summary>
+        /// 获取节点
+        /// </summary>
+        /// <param name="key">节点的关键字</param>
+        /// <returns>对应节点（没有则返回空）</returns>
+        protected UCTNode GetNode(NodeData key)
+        {
+            lock (DataSet)
+            {
+                UCTNode data = null;
+                DataSet.TryGetValue(key, out data);
+                return data;
+            }
+        }
+        /// <summary>
+        /// 清空搜索树
+        /// </summary>
+        public void Clear()
+        {
+            DataSet.Clear();
+        }
+        /// <summary>
+        /// 这个用于创建或者得到节点的
+        /// </summary>
+        /// <param name="game">当前棋盘</param>
+        /// <returns>该棋盘对应的元组</returns>
+        public KeyValuePair<IndexUCT, UCTNode> GetOrInsertNode(Board game)
+        {
+            lock (DataSet)
+            {
+                var Key = new NodeData(game);
+                UCTNode Value = null;
+                bool existed = DataSet.TryGetValue(Key, out Value);
+                if (!existed)
+                {
+                    Value = new UCTNode();
+                    Value.Update(Key.EnabledPos);
+                    Value.CurrentScore = CalculateScore(game, true);
+                    DataSet.Add(Key, Value);
+                }
+                return new KeyValuePair<IndexUCT, UCTNode>(Key, Value);
+            }
+        }
+        public int NodeCounts { get { return (DataSet.Count); } }
+    }
+    /// <summary>
+    /// UCT搜索树
+    /// </summary>
+    partial class UCT : UCTStorge
+    {
+        private volatile uint TotalSimulateCount = 0;
+        /*最大允许2M个经验节点*/
+        public int MAX_UCT_NODE = 2097152;
+        /*最大允许6000次不清理节点的自对弈*/
+        public int MAX_UCT_SEARCH_PER_EPORCH = 6000;
+        private int SearchDepth = 422;
+        private float Cpuct = 1.0f;
+        private float DefaultUCB = 1.0f;
+        private Random random_dev = new Random(0x76532FFD);
+        public UCT(int SearchDepth = 422) : base(SearchDepth) { this.SearchDepth = SearchDepth; }
+        public bool EnableRecord { get; set; }
+        public bool RLMode { get; set; } = false;
+        public NN_Model Model { get; set; }
+        /*分析棋盘，用以返回最后的评分（估算）*/
+        public float Analysis(Board game_root_state)
+        {
+            return GetorComputeScore(game_root_state, true);
+        }
+        /*自对弈经验累积*/
+        public void ReinforceLearning(int Training_Time, TimeType timetype)
+        {
+            var totaltime = 0;
+            var TrainingTime = Training_Time;
+            bool TimeRemained = true;
+            string pos_char = "";
+            int count_play = 0;
+            GameTimer timer = new GameTimer();
+            timer.Reset();
+            SGF sgfFile = new SGF();
+            ThreadPool.SetMaxThreads(WorkerCount, WorkerCount);
+            /*经验回放机制*/
+            List<KeyValuePair<IndexUCT, UCTNode>> ExpRoot = new List<KeyValuePair<IndexUCT, UCTNode>>(SearchDepth);
+            List<int> Poses = new List<int>(SearchDepth);
+            /*自对弈过程*/
+            while (TimeRemained)
+            {
+                /*重置搜索空间*/
+                Clear();
+                Board game = AllocateGame();
+                InitializeBoard(ref game);
+                Stone color = S_BLACK;
+                int pos = PASS;
+                bool resign = false;
+                var play_depth = 422;
+                var pass_count = 0;
+                //if (EvalThread != null && (EvalThread.ThreadState & ThreadState.Unstarted) != 0)
+                //    EvalLoop();
+                /*自对弈开始*/
+                do
+                {
+                    pos = Search(game, color, random_dev, true);
+                    Console.WriteLine("genmove " + ((color == S_BLACK) ? "b" : (color == S_WHITE) ? "w" : "e"));
+                    if (pos != RESIGN && pass_count < 2)
+                    {
+                        PutStone(game, pos, color);
+                        sgfFile.Record(game);
+                        Poses.Add(game.ToBoardPos(pos, false));
+                        ExpRoot.Add(GetOrInsertNode(game));
+                    }
+                    else if (pos == PASS)
+                        pass_count++;
+                    else
+                        resign = true;
+                    color = FLIP_COLOR(color);
+                    PrintBoard(game);
+                    IntegerToString(pos, out pos_char);
+                    Console.WriteLine("=" + pos_char);
+                    play_depth--;
+                } while (play_depth > 0 && !resign && pass_count < 2);
+                /*经验回放过程*/
+                for (int i = ExpRoot.Count - 1; i >= 1; i--)
+                {
+                    var ppos = GetPureBoardPos(ExpRoot[i].Key.LastestPos);
+                    ExpRoot[i - 1].Value.value_win_node[ppos] = ExpRoot[i].Value.WinnerCount;
+                    ExpRoot[i - 1].Value.visit_count_node[ppos] = ExpRoot[i].Value.visit_count;
+                    ExpRoot[i - 1].Value.visit_count = 0;
+                    ExpRoot[i - 1].Value.WinnerCount = 0;
+                    for (var j = 0; j < pure_board_max; j++)
+                    {
+                        ExpRoot[i - 1].Value.visit_count -= ExpRoot[i - 1].Value.visit_count_node[j];
+                        ExpRoot[i - 1].Value.WinnerCount += ExpRoot[i - 1].Value.value_win_node[j];
+                    }
+                }
+                /*使用Q-Learning更新Q表信息*/
+                var Socre = game.Score_Final / (game.BoardSize * game.BoardSize);
+                var PassPos = ExpRoot[Poses.Count - 1].Key.BoardSize * ExpRoot[Poses.Count - 1].Key.BoardSize;
+                for (var index = Poses.Count - 1; index >= 0; index--)
+                {
+                    var ppos = Poses[index];
+                    ppos = ppos < 0 ? PassPos : ppos;
+                    var E_gready = (float)Sqrt(2 * Log(ExpRoot[index].Value.visit_count) / (ExpRoot[index].Value.P[ppos] + 1.0f));
+                    lock (ExpRoot[index].Value)
+                    {
+                        if (ExpRoot.Count - 1 > index)
+                        {
+                            ExpRoot[index].Value.P[ppos] = (ExpRoot[index].Value.P[ppos] + (1 - gamma) * epsional_qlearning * (Socre * ExpRoot[index].Key.CurrentPlayer + E_gready * ExpRoot[index + 1].Value.P.Max()));
+                        }
+                    }
+                    ExpRoot[index].Value.UpdateNormalizedP();
+                }
+                ExpRoot.AsParallel().ForAll((KeyValuePair<IndexUCT, UCTNode> node) => { node.Value.UpdateNormalizedP(); });
+                //EvalDisabled();
+                DNN.Train(ExpRoot, 0.002, 2000, 100);
+                DNN.Save();
+                sgfFile.Save(GetExpFilePath() + "Training");
+                //TrainAndSave();
+                /*训练NN*/
+                //Training();
+                ExpRoot.Clear();
+                if (EnableRecord)
+                {
+                    SGF sgfrec = new SGF();
+                    sgfrec.Record(game);
+                    sgfrec.Save(RL_SGF_NM);
+                }
+                DNN.ClearQueue();
+                count_play++;
+                /*保存Q表*/
+                //Qtable.Save();
+                /*显示所用的时间*/
+                WriteLog($"Current Time:{DateTime.Now.ToLocalTime()}" + Environment.NewLine +
+                   $"Current Count:{count_play}" + Environment.NewLine +
+                  $"Total Cost Time:{timer.elapsed_minutes()} Minutes" + Environment.NewLine +
+                $"Total Simulate:{TotalSimulateCount}" + Environment.NewLine);
+                Console.Error.Write("Total Cost Time:");
+                switch (timetype)
+                {
+                    case TimeType.second:
+                        totaltime = timer.elapsed_seconds();
+                        TimeRemained = (TrainingTime >= totaltime);
+                        Console.Error.Write(totaltime + "Seconds");
+                        break;
+                    case TimeType.minute:
+                        totaltime = timer.elapsed_minutes();
+                        TimeRemained = (TrainingTime >= totaltime);
+                        Console.Error.Write(totaltime + "Minutes");
+                        break;
+                    case TimeType.hour:
+                        totaltime = timer.elapsed_hours();
+                        TimeRemained = (TrainingTime >= totaltime);
+                        Console.Error.Write(totaltime + "Hours");
+                        break;
+                    default:
+                        break;
+                }
+                FreeGame(ref game);
+            }
+        }
+        /*搜索走子*/
+        public int Genmove(Board game_root_state, Stone player_color)
+        {
+            return Search(game_root_state, player_color, random_dev);
+        }
+        public void SetMode(SEARCH_MODE mode, int value = 10000)
+        {
+            SearchMode = mode;
+            switch (mode)
+            {
+                case CONST_PLAYOUT_MODE:
+                    SearchMode = mode;
+                    MaxSearchCount = value;
+                    break;
+                case CONST_TIME_MODE:
+                    SearchMode = mode;
+                    MaxThinkingMs = value;
+                    break;
+                default:
+                    break;
+            }
+        }
+        public void SetMode(SEARCH_MODE mode, int value_time = 10000, int value_playsout = 10000)
+        {
+            switch (mode)
+            {
+                case CONST_PLAYOUT_TIME_MODE:
+                    SearchMode = mode;
+                    MaxSearchCount = value_playsout;
+                    MaxThinkingMs = value_time;
+                    break;
+                default:
+                    break;
+            }
+        }
+        public void SetThreads(uint value)
+        {
+            WorkerCount = Min(Environment.ProcessorCount - 1, Max((int)value, 4));
+        }
+        public void InitSearch(int threads = 4, int depth = 422, float cpuct = 1.0f, float defaultUCB = 1.0f)
+        {
+            WorkerCount = Min(Environment.ProcessorCount - 1, Max(threads, 4));
+            SearchDepth = Min(MAX_MOVES - 1, Max(depth, 400));
+            Cpuct = Max(cpuct, 0);
+            DefaultUCB = Max(defaultUCB, 0);
+        }
+    }
+    partial class UCT : UCTStorge
+    {
+        DQN_DNN_Class DNN = new DQN_DNN_Class();
+        Thread EvalThread;
+        public void NNInit()
+        {
+            LoadOrCreate();
+            //EvalLoop();
+        }
+        void LoadOrCreate()
+        {
+            DNN.SetupModel(Model);
+            if (!DNN.Load())
+                DNN.CreateModel(CNTK.DeviceDescriptor.UseDefaultDevice(), Model);
+        }
+        void EvalNode(KeyValuePair<IndexUCT, UCTNode> node)
+        {
+            DNN.EvalNode(node);
+        }
+        void EvalLoop()
+        {
+            DNN.EnableEvalThread = true;
+            if (EvalThread == null)
+                EvalThread = new Thread((object obj) => { DNN.Eval(); });
+            EvalThread.Start();
+        }
+        void EvalDisabled()
+        {
+            DNN.EnableEvalThread = false;
+            EvalThread.Join();
+            EvalThread = null;
+        }
+        void TrainAndSave()
+        {
+            DNN.Train(DataSet.ToList(), 0.002, 1000, 1024);
+            DNN.Save();
+        }
+    }
+    /// <summary>
+    /// UCT搜索树（传统搜索模块）
+    /// </summary>
+    partial class UCT : UCTStorge
+    {
+        /// <summary>
+        /// 衰减率
+        /// </summary>
+        private static readonly List<float> Lambdas;
+        /// <summary>
+        /// UCT搜索初始化
+        /// </summary>
+        static UCT()
+        {
+            Lambdas = new List<float>(new float[MAX_RECORDS - 1]);
+            for (int i = Lambdas.Count - 1; i >= 0; i--)
+                Lambdas[i] = (float)Pow(lambdaSarsa, (Lambdas.Count - 1 - i));
+        }
+        private SEARCH_MODE SearchMode;
+        /// <summary>
+        /// 最大搜索次数
+        /// </summary>
+        private int MaxSearchCount = 10000;
+        /// <summary>
+        /// 最大思考时间
+        /// </summary>
+        private int MaxThinkingMs = 10000;
+        private int CurrentThinkingMs = 10000;
+        /// <summary>
+        /// 搜索中计时器如果到点了会吧值置为真
+        /// </summary>
+        private bool TimeUsedUp { get { lock (MyTimer) return MyTimer.elapsed() >= MaxThinkingMs; } }
+        /// <summary>
+        /// 搜索次数累计
+        /// </summary>
+        private volatile int Search_Counter = 0;
+        /// <summary>
+        /// 定时器
+        /// </summary>
+        private GameTimer MyTimer = new GameTimer();
+        private string DefaultFileName;
+        /// <summary>
+        /// 是否超过了节点数量限制
+        /// </summary>
+        /// <returns>是否超过了这个阈值</returns>
+        private bool OverflowNodeCounts { get { lock (DataSet) return DataSet.Count >= MaxiumNodes; } }
+        /// <summary>
+        /// 计算期望值使用U+Q
+        /// </summary>
+        /// <param name="current">当前节点位置</param>
+        /// <param name="game">当前节点对应的棋盘</param>
+        /// <param name="player_color">玩家所属方</param>
+        /// <returns>UCB值与合法坐标点的评估</returns>
+        private List<ValueTuple<int, float>> Expectation(UCTNode current, Board game, Stone player_color, bool useNN = true)
+        {
+            List<ValueTuple<int, float>> ExpectationPoses = new List<ValueTuple<int, float>>();
+            /*每次运算的时候+1或者-1不变，其值已经加权平均已经包含在分子里了*/
+            float total_win = current.W;
+            /*这个是总访问次数是分母*/
+            float total_visit_count = (current.visit_count == 0 ? 1 : current.visit_count);
+            float Expand_Up_Elem = (float)Sqrt(2 * Log(total_visit_count));
+            float avgvalue = total_win / total_visit_count;
+            /*计算UCB值*/
+            for (var p_pos = 0; p_pos < pure_board_max; p_pos++)
+            {
+                /*得到该点在全棋盘上的坐标（因为做过padding所以会很大）*/
+                var f_pos = GetFullBoardPos(p_pos);
+                /*是否合法判断*/
+                var islegal = IsLegal(game, f_pos, player_color) && game.candidates[f_pos];
+                /*压入合法的点并且ucb值大于投降阈值*/
+                if (islegal)
+                {
+                    /*使用UCB公式计算*/
+                    float ucb = 0;
+                    //var avgvalue = current.value_win_node[p_pos] / (float)(current.visit_count_node[p_pos] + 1.0f);
+                    if (useNN)
+                        ucb = current.P[p_pos] + Cpuct * (Expand_Up_Elem / (current.visit_count_node[p_pos] + 1.0f));
+                    else
+                        ucb = avgvalue + Cpuct * (Expand_Up_Elem / (current.visit_count_node[p_pos] + 1.0f));
+                    /*如果不是投降阈值，则是合法走步*/
+                    //if (ucb > RESIGN)
+                    ExpectationPoses.Add(new ValueTuple<int, float>(f_pos, ucb));
+                }
+            }
+            //if (ExpectationPoses.Count > 0)
+            //    ExpectationPoses.Sort((ValueTuple<int, float> data1, ValueTuple<int, float> data2) => { var cmp = data2.Item2 - data1.Item2; return cmp > 0 ? 1 : cmp < 0 ? -1 : 0; });
+            return ExpectationPoses;
+        }
+        /// <summary>
+        /// 使用U+Q公式选择最大走子
+        /// </summary>
+        /// <param name="current">当前节点位置</param>
+        /// <param name="game">当前节点对应的棋盘</param>
+        /// <param name="player_color">玩家所属方</param>
+        /// <param name="random">随机数</param>
+        /// <returns></returns>
+        private int SelectBestPos(UCTNode current, Board game, Stone player_color, Random random, bool useNN = true)
+        {
+            return GetMaxPos(Expectation(current, game, player_color, useNN), random);
+        }
+        /// <summary>
+        /// 选择价值最大的位置
+        /// </summary>
+        /// <param name="legal_pos_array">筛选过节点的合法数组</param>
+        /// <param name="random">随机数发生器</param>
+        /// <returns>最好的那个坐标</returns>
+        private int GetMaxPos(List<ValueTuple<int, float>> legal_pos_array, Random random)
+        {
+            /*如果没有可以走的点*/
+            if (legal_pos_array.Count == 0) return PASS;
+            /*坐标排序*/
+            legal_pos_array.Sort((ValueTuple<int, float> A, ValueTuple<int, float> B) => { return (B.Item2 - A.Item2) > 0 ? 1 : (B.Item2 - A.Item2) < 0 ? -1 : 0; });
+            /*得到最大值*/
+            var value_max = legal_pos_array.Max((ValueTuple<int, float> data) => { return data.Item2; });
+            /*统计最大值的数量*/
+            var max_value_count = 0;
+            for (int i = 0; i < legal_pos_array.Count; i++)
+                max_value_count += (value_max == legal_pos_array[i].Item2) ? 1 : 0;
+            /*找出最大的那个，并返回坐标*/
+            var pos = legal_pos_array[random.Next(0, max_value_count - 1)].Item1;
+            return pos;
+        }
+        /// <summary>
+        /// 得到文件名(存储搜索树的节点的文件名)
+        /// </summary>
+        /// <returns>文件名称</returns>
+        private string GetFileName()
+        {
+            DefaultFileName = "";
+            DefaultFileName += Path;
+            DefaultFileName += RL_NM;
+            DefaultFileName += Model_expand[(int)NN_Model.None_NN];
+            return DefaultFileName;
+        }
+    }
+    partial class UCT : UCTStorge
+    {
+        #region 搜索
+        private volatile bool QuitSearch = false;
+        /// <summary>
+        /// 对当前节点搜索出一个解
+        /// </summary>
+        /// <param name="game">当前棋盘</param>
+        /// <param name="player">当前搜索方</param>
+        /// <param name="random">随机数</param>
+        /// <returns>坐标</returns>
+        private int Search(Board game, Stone player, Random random, bool Selfplay = true)
+        {
+            GameTimer gameTimer = new GameTimer();
+            EvalLoop();
+            /*当前盘面对应的节点*/
+            KeyValuePair<IndexUCT, UCTNode> CurrentRoot = default(KeyValuePair<IndexUCT, UCTNode>);
+            /*扩展数列*/
+            //List<ValueTuple<IBoardUCT, Stone, float, KeyValuePair<IndexUCT, UCTNode>>> ExpandedList;
+            ValueTuple<Board, Stone, float, KeyValuePair<IndexUCT, UCTNode>, int>[] ExpandedList = null;
+            /*存储输出时用的坐标*/
+            int pos = PASS;
+            /*搜索路径记录，好返回结果*/
+            List<KeyValuePair<IndexUCT, UCTNode>> NeedsToUpdate = new List<KeyValuePair<IndexUCT, UCTNode>>();
+            /*扩展根节点*/
+            /* List<ValueTuple<IBoardUCT, Stone, float, KeyValuePair<IndexUCT, UCTNode>>>*/
+            void Expand(bool NewNodes = true)
+            {
+                CurrentRoot = GetOrInsertNode(game);
+                var pos_ucbs = Expectation(CurrentRoot.Value, game, player);
+                var next_color = FLIP_COLOR(player);
+                var BoardArrays = game.DeepCopy(pos_ucbs.Count);
+                if (NewNodes || ExpandedList == null)
+                {
+                    ExpandedList = new ValueTuple<Board, Stone, float, KeyValuePair<IndexUCT, UCTNode>, int>[pos_ucbs.Count];
+                    Parallel.For(0, pos_ucbs.Count, (int i) =>
+                    {
+                        ExpandedList[i].Item1 = (Board)BoardArrays[i];
+                        PutStone(ExpandedList[i].Item1, pos_ucbs[i].Item1, player);
+                        ExpandedList[i].Item2 = next_color;
+                        ExpandedList[i].Item3 = pos_ucbs[i].Item2;
+                        ExpandedList[i].Item4 = GetOrInsertNode(ExpandedList[i].Item1);
+                        if (!ExpandedList[i].Item4.Value.Evaled)
+                            EvalNode(ExpandedList[i].Item4);
+                    });
+                }
+                else
+                {
+                    Parallel.ForEach(pos_ucbs, (ValueTuple<int, float> pos_ucbs_node) =>
+                    {
+                        var thispos = pos_ucbs_node.Item1;
+                        var index = Array.FindIndex(ExpandedList, (ValueTuple<Board, Stone, float, KeyValuePair<IndexUCT, UCTNode>, int> v_data) =>
+                        {
+                            return v_data.Item1.record[v_data.Item1.Moves - 1].pos == thispos;
+                        });
+                        ExpandedList[index].Item3 = pos_ucbs_node.Item2;
+                    });
+                }
+                Array.Sort(ExpandedList, (ValueTuple<Board, Stone, float, KeyValuePair<IndexUCT, UCTNode>, int> A, ValueTuple<Board, Stone, float, KeyValuePair<IndexUCT, UCTNode>, int> B) =>
+                {
+                    var cmp = A.Item3 - B.Item3;
+                    return cmp > 0 ? -1 : cmp < 0 ? 1 : 0;
+                });
+                Parallel.For(0, pos_ucbs.Count, (int i) =>
+                {
+                    ExpandedList[i].Item5 = i;
+                });
+            }
+            /*得到最佳走子*/
+            int GetPos(KeyValuePair<IndexUCT, UCTNode> currentRoot, Board game_root_state, Stone player_color)
+            {
+                //var pos = SelectMaxChild(currentRoot, game_root_state, player_color, *mts[0], Cpuct);
+                pos = SelectBestPos(currentRoot.Value, game_root_state, player_color, random, false);
+                bool enable_to_resigned = (Selfplay ? ((pure_board_max - 10) < currentRoot.Key.Moves) : ((pure_board_max / 2 - 10) < currentRoot.Key.Moves));
+                if (enable_to_resigned)
+                {
+                    var pure_pos = GetPureBoardPos(pos);
+                    var pass_wp = (float)currentRoot.Value.value_win_node[pure_board_max] / (currentRoot.Value.visit_count_node[pure_board_max] + 1);
+                    var best_wp = currentRoot.Value.value_win_node[pure_pos] / (currentRoot.Value.visit_count_node[pure_pos] + 1);
+                    if ((pass_wp >= PASS_THRESHOLD || game_root_state.LastestPassMove(3)) && game_root_state.LastestPassMove(1))
+                    {
+                        pos = PASS;
+                    }
+                    else if (game_root_state.Moves >= MAX_MOVES)
+                    {
+                        pos = PASS;
+                    }
+                    else if (best_wp <= RESIGN_THRESHOLD)
+                    {
+                        pos = RESIGN;
+                    }
+                }
+                return pos;
+            }
+            /*进行N次模拟*/
+            void Simulate(ValueTuple<Board, Stone, float, KeyValuePair<IndexUCT, UCTNode>, int> ThreadData)
+            {
+                List<KeyValuePair<IndexUCT, UCTNode>> FeedBackPath = new List<KeyValuePair<IndexUCT, UCTNode>>(SearchDepth);
+                List<int> PPosList = new List<int>(SearchDepth);
+                var PassPos = ThreadData.Item1.BoardSize * ThreadData.Item1.BoardSize;
+                while (!QuitSearch)
+                {
+                    Board game_t = (Board)ThreadData.Item1.Clone();
+                    TotalSimulateCount++;
+                    /*初始化*/
+                    PPosList.Clear();
+                    FeedBackPath.Add(CurrentRoot);
+                    var maxium_move = SearchDepth - game_t.Moves;
+                    var color = ThreadData.Item2;
+                    var current_root = ThreadData.Item4;
+                    var pre_node = current_root;
+                    FeedBackPath.Add(CurrentRoot);
+                    PPosList.Add(GetPureBoardPos(current_root.Key.LastestPos));
+                    /*前向搜索,先做扩展*/
+                    while (maxium_move != 0 && !game_t.GameOver)
+                    {
+                        maxium_move--;
+                        /*前一个节点*/
+                        pre_node = current_root;
+                        /*选择走子，如果要使用Sarsa这个地方要加入优势评估函数*/
+                        var next_pos = SelectBestPos(current_root.Value, game_t, color, random);
+                        var ppos = GetPureBoardPos(next_pos);
+                        PPosList.Add(ppos);
+                        game_t.PutStone_UCT(ppos);
+                        /*模拟走子（走一步）并入栈*/
+                        current_root = GetOrInsertNode(game_t);
+                        /*加入搜索队列*/
+                        FeedBackPath.Add(current_root);
+                        /*如果有NN估值器，则使用NN*/
+                        if (!current_root.Value.Evaled)
+                        {
+                            if (DNN.EvalQueueFull())
+                                Thread.Sleep(1);
+                            EvalNode(current_root);
+                        }
+                        /*若要使用Sarsa(lambda)，该地方要更新权值(Online)*/
+                        if (gamma > 0 && PPosList.Count >= 2)
+                        {
+                            var Reward = (FeedBackPath[FeedBackPath.Count - 2].Key.Score_Board - FeedBackPath[FeedBackPath.Count - 3].Key.Score_Board) / PassPos;
+                            int LambdaStartPos = Lambdas.Count - 1;
+                            for (int index = FeedBackPath.Count - 3; index >= 0; index--)
+                            {
+                                int next_action = PPosList[index + 1], action = PPosList[index];
+                                action = (action == -1 ? PassPos : action);
+                                next_action = (next_action == -1 ? PassPos : action);
+                                var E_gready = (float)Sqrt(2 * Log(FeedBackPath[index].Value.visit_count) / (FeedBackPath[index].Value.P[ppos] + 1.0f));
+                                lock (FeedBackPath[index].Value)
+                                {
+                                    FeedBackPath[index].Value.P[action] = FeedBackPath[index].Value.P[action] + gamma * epsional_qlearning * (Reward + E_gready * FeedBackPath[index + 1].Value.P[next_action]);
+                                }
+                                FeedBackPath[index].Value.UpdateNormalizedP();
+                            }
+                        }
+                    }
+                    /*值回传:由后往前传回值*/
+                    var Socre = game_t.Score_Final / (game_t.BoardSize * game_t.BoardSize);
+                    var winner = game_t.Winner;
+                    for (var index = PPosList.Count - 1; index >= 0; index--)
+                    {
+                        var winner_data = winner * FeedBackPath[index].Key.CurrentPlayer;
+                        var ppos = PPosList[index];
+                        ppos = ppos < 0 ? pure_board_max : ppos;
+                        FeedBackPath[index].Value.WinnerCount += winner_data;
+                        FeedBackPath[index].Value.visit_count++;
+                        FeedBackPath[index].Value.W += winner_data;
+                        var E_gready = (float)Sqrt(2 * Log(FeedBackPath[index].Value.visit_count) / (FeedBackPath[index].Value.P[ppos] + 1.0f));
+                        lock (FeedBackPath[index].Value)
+                        {
+                            FeedBackPath[index].Value.value_win_node[ppos] += winner_data;
+                            FeedBackPath[index].Value.visit_count_node[ppos] += 1;
+                            if (FeedBackPath.Count - 1 > index)
+                            {
+                                FeedBackPath[index].Value.P[ppos] = (FeedBackPath[index].Value.P[ppos] + (1 - gamma) * epsional_qlearning * (Socre * FeedBackPath[index].Key.CurrentPlayer + E_gready * FeedBackPath[index + 1].Value.P.Max()));
+                            }
+                        }
+                        FeedBackPath[index].Value.UpdateNormalizedP();
+                    }
+                    Search_Counter++;
+                }
+            }
+            /*当前的搜索深度*/
+            var current_depth = game.Moves;
+            if (game.Moves < 2)
+                CurrentThinkingMs = MaxThinkingMs / 5;
+            else
+                CurrentThinkingMs = MaxThinkingMs;
+            /*重置搜索计数*/
+            Search_Counter = 0;
+            /*设置最大的搜索线程数量*/
+            ThreadPool.SetMaxThreads(WorkerCount, WorkerCount);
+            /*重置定时器*/
+            MyTimer.Reset();
+            /*依据当前盘面扩展棋盘*/
+            //ExpandedList = Expand();
+            /*搜索开始*/
+            Expand(false);
+            /*多线程模拟N次*/
+            var counts = Min(ExpandedList.Length, (WorkerCount));
+            gameTimer.Reset();
+            //模拟开始
+            if (counts > 0)
+            {
+                Parallel.For(0, counts, (int i) =>
+                {
+                    if (i < counts - 1)
+                        Simulate(ExpandedList[i]);
+                    else
+                    {
+                        while (!QuitSearch)
+                        {
+                            QuitSearch = gameTimer.elapsed() > CurrentThinkingMs;
+                        }
+                    }
+                });
+            }
+            QuitSearch = false;
+            /*子节点的值返回根节点*/
+            //FeedBackNodes();
+            /*清理超出界限的节点*/
+            //ClearOutbandNodes();
+            Clear();
+            /*是否是满了或者是次数到了*/
+            var ms_time = MyTimer.elapsed();
+            /*获取走子点*/
+            pos = GetPos(CurrentRoot, game, player);
+            /*清理超出界限的节点*/
+            //ClearOutbandNodes();
+            EvalDisabled();
+            //Console.Error.WriteLine("Step Count:" + Search_Counter);
+            //Console.Error.WriteLine("Time Cost :" + ms_time + "ms");
+            //Console.Error.WriteLine("UCT Nodes :" + NodeCounts);
+            while (!DNN.EvalQueueEmpty()) ;
+            /*返回走子点*/
+            return pos;
+        }
+        #endregion
+    }
+    public static partial class QUCTSearch
+    {
+        public static int Genmove(IBoardUCT board)
+        {
+            return 0;
+        }
+        public static void Play(int pos)
+        {
+        }
+    }
+    /// <summary>
+    /// 私有搜索方法
+    /// </summary>
+    public static partial class QUCTSearch
+    {
+        #region MyRegion
+        private static int Search(IBoardUCT board, int ThinkingTime = 1000)
+        {
+            var NodesList = ExpandNode(board);
+            if (NodesList == null) return board.BoardSize * board.BoardSize;
+            var counts = Min(NodesList.Count, (WorkerCount - 1));
+            GameTimer timer = new GameTimer();
+            Parallel.For(0, counts, (int index) =>
+            {
+                if (index == counts - 1)
+                {
+                    while (!SimulateRunEnable)
+                        SimulateRunEnable = (timer.elapsed() > ThinkingTime);
+                }
+                else
+                {
+                    Simulate(NodesList[index]);
+                }
+            });
+            TreeNode treeNode = Cache[board.SHA256HASH];
+            bool enable_to_resigned = board.Moves > StepResign;
+            treeNode.UpdateU(Cpuct, UsingNewMethod, enable_to_resigned);
+            int pos = SelectPos(board, treeNode);
+            if (enable_to_resigned)
+            {
+                var pass_wp = treeNode.W_Next[treeNode.W_Next.Length - 1] / (treeNode.N_Next[pure_board_max] + 1);
+                var best_wp = treeNode.W_Next[pos] / (treeNode.N_Next[pos] + 1);
+                if (pass_wp >= PASS_THRESHOLD || board.GameOver)
+                {
+                    pos = board.BoardSize * board.BoardSize;
+                }
+                else if (board.Moves >= MAX_MOVES)
+                {
+                    pos = board.BoardSize * board.BoardSize;
+                }
+                else if (best_wp <= RESIGN_THRESHOLD)
+                {
+                    pos = RESIGN;
+                }
+            }
+            return pos;
+        }
+        #endregion
+        #region 搜索树私有方法和变量
+        /// <summary>
+        /// 控制搜索模拟的控制变量
+        /// </summary>
+        private static volatile bool SimulateRunEnable;
+        /// <summary>
+        /// 是否使用新的方法
+        /// </summary>
+        private const bool UsingNewMethod = false;
+        /// <summary>
+        /// 依据当前盘面扩展节点
+        /// </summary>
+        /// <param name="board">当前盘面</param>
+        /// <returns>扩展后的结果</returns>
+        private static List<(IBoardUCT, TreeNode, int, int, float, TreeNode)> ExpandNode(IBoardUCT board)
+        {
+            //寻找棋盘对应的节点
+            TreeNode treeNode = null;
+            //查询当前盘面是否在缓存里
+            if (!Cache.TryGetValue(board.SHA256HASH, out treeNode))
+            {
+                treeNode = new TreeNode(board);
+                Cache.Add(treeNode.SHA256HASH, treeNode);
+            }
+            else
+            {
+                treeNode = Cache[board.SHA256HASH];
+            }
+            //计算UCB值
+            treeNode.UpdateU(Cpuct, false, treeNode.Moves > StepResign);
+            //得到可落子的点
+            var LegalPos = treeNode.GetAvaliablePos();
+            //没有可落子的点
+            if (LegalPos == null || LegalPos.Length < 1) return null;
+            //统计不为0的数值数量,并创建拷贝数量
+            var BoardArrays = board.DeepCopy(LegalPos.Length);
+            //创建待扩展列表
+            (IBoardUCT, TreeNode, int, int, float, TreeNode)[] ExpandList = new (IBoardUCT, TreeNode, int, int, float, TreeNode)[BoardArrays.Length];
+            //并行扩展
+            Parallel.For(0, ExpandList.Length, (int index) =>
+            {
+                //期盼附加到数组上面
+                ExpandList[index].Item1 = (IBoardUCT)BoardArrays[index];
+                //先落上可落子点
+                ExpandList[index].Item1.PutStone_UCT(LegalPos[index]);
+                //生成树节点
+                ExpandList[index].Item2 = new TreeNode(ExpandList[index].Item1);
+                //合法落子位置添加
+                ExpandList[index].Item3 = LegalPos[index];
+                //该盘面的编号
+                ExpandList[index].Item4 = index;
+                //当前盘面的UCB值
+                ExpandList[index].Item5 = treeNode.U[LegalPos[index]] + treeNode.Q[LegalPos[index]];
+                //更新UCB值
+                ExpandList[index].Item2.UpdateU(Cpuct, false, ExpandList[index].Item1.Moves > StepResign);
+                //添加根节点
+                ExpandList[index].Item6 = treeNode;
+            });
+            //依次输入至缓存
+            for (int index = 0; index < ExpandList.Length; index++)
+            {
+                if (!Cache.ContainsKey(ExpandList[index].Item2.SHA256HASH))
+                    Cache.Add(ExpandList[index].Item2.SHA256HASH, ExpandList[index].Item2);
+            }
+            //返回扩展过程的结果
+            var TempList = new List<(IBoardUCT, TreeNode, int, int, float, TreeNode)>(ExpandList);
+            //依据扩展的UCB值排序（最大的排最前面）
+            TempList.Sort(((IBoardUCT, TreeNode, int, int, float, TreeNode) x, (IBoardUCT, TreeNode, int, int, float, TreeNode) y) =>
+            {
+                if (x.Item2 == null)
+                {
+                    if (y.Item2 == null)
+                        return 0;
+                    else
+                        return 1;
+                }
+                else
+                {
+                    if (y.Item2 == null)
+                        return -1;
+                    else
+                    {
+                        if (x.Item5 > y.Item5)
+                            return -1;
+                        else if (x.Item5 < y.Item5)
+                            return 1;
+                        else
+                            return 0;
+                    }
+                }
+            });
+            //返回排序后的扩展表
+            return TempList;
+        }
+        /// <summary>
+        /// UCT树内缺省模拟
+        /// </summary>
+        /// <param name="SimulateItem">模拟参数</param>
+        private static void Simulate((IBoardUCT, TreeNode, int, int, float, TreeNode) SimulateItem)
+        {
+            List<(TreeNode, int)> Path = new List<(TreeNode, int)>();
+            while (SimulateRunEnable)
+            {
+                Path.Clear();
+                var board = (IBoardUCT)SimulateItem.Item1.Clone();
+                Path.Add((SimulateItem.Item6, SimulateItem.Item3));
+                TreeNode _TreeNode = SimulateItem.Item2;
+                int pos = SelectPos(board, _TreeNode);
+                Path.Add((_TreeNode, pos));
+                board.PutStone_UCT(pos);
+                while (!board.GameOver)
+                {
+                    _TreeNode = AddNode(board);
+                    pos = SelectPos(board, _TreeNode);
+                    Path.Add((_TreeNode, pos));
+                    board.PutStone_UCT(pos);
+                    SarsaLambdaUpdate(Path, board);
+                }
+                Backup(Path, board.Winner);
+            }
+        }
+        /// <summary>
+        /// 筛选当前节点
+        /// </summary>
+        /// <param name="CurrentBoard">当前盘面</param>
+        /// <param name="CurrentNode">当前使用的搜索节点</param>
+        /// <returns>下一步所走的子</returns>
+        private static int SelectPos(IBoardUCT CurrentBoard, TreeNode CurrentNode)
+        {
+            //定义工作数组
+            (int, float)[] UCBList = null;
+            //读取节点信息
+            lock (CurrentNode)
+            {
+                var U = CurrentNode.U;
+                var LegalPos = CurrentNode.GetAvaliablePos();
+                //制作位置-UCB值对
+                UCBList = new (int, float)[LegalPos.Length];
+                for (int index = 0; index < LegalPos.Length; index++)
+                {
+                    UCBList[index].Item1 = LegalPos[index];
+                    UCBList[index].Item2 = U[LegalPos[index]] + CurrentNode.Q[LegalPos[index]];
+                }
+            }
+            //如果没有可走的子，返回PASS
+            if (UCBList == null || UCBList.Length < 1)
+                return (CurrentNode.ActionsLength - 1);
+            //对UCB值排序
+            Array.Sort(UCBList, ((int, float) x, (int, float) y) =>
+            {
+                if (x.Item2 > y.Item2)
+                    return -1;
+                else if (x.Item2 < y.Item2)
+                    return 1;
+                else
+                    return 0;
+            });
+            //找出UCB最大的值及其数量
+            var MaxUCBValue = UCBList[0].Item2;
+            int MaxUCBCount = Array.IndexOf(UCBList, UCBList.Last(((int, float) item) => { return (MaxUCBValue == item.Item2); }));
+            //生成随机索引
+            Random random = new Random();
+            //返回所需要的那个节点
+            return UCBList[random.Next(0, MaxUCBCount)].Item1;
+        }
+        /// <summary>
+        /// 值回传过程（不仅回传胜利者，还使用QLearning更新Q表）
+        /// </summary>
+        /// <param name="Path">搜索路径</param>
+        /// <param name="Winner">胜利者</param>
+        private static void Backup(List<(TreeNode, int)> Path, sbyte Winner)
+        {
+            for (int index = Path.Count - 1; index >= 0; index--)
+            {
+                lock (Path[index].Item1)
+                {
+                    var pos = Path[index].Item2;
+                    var Node = Path[index].Item1;
+                    Node.V += Winner * Path[index].Item1.CurrentPlayer;
+                    Node.N++;
+                    Node.N_Next[Path[index].Item2]++;
+                    Node.W_Next[Path[index].Item2] += Winner * Path[index].Item1.CurrentPlayer;
+                    if (index < Path.Count - 1)
+                    {
+                        Node.Q[pos] = (1 - LearningRateQTable) * Path[index].Item1.Q[pos] + LearningRateQTable * (Winner * Path[index].Item1.CurrentPlayer + Path[index + 1].Item1.U.Max());
+                    }
+                }
+            }
+        }
+        /// <summary>
+        /// Sarsa(Lambda)更新策略
+        /// </summary>
+        /// <param name="Path">更新路径</param>
+        /// <param name="board">棋盘</param>
+        private static void SarsaLambdaUpdate(List<(TreeNode, int)> Path, IBoardUCT board)
+        {
+            var lambdaPos = Lambdas.Count - 1;
+            for (int index = Path.Count - 1; index >= 0; index--)
+            {
+                lock (Path[index].Item1)
+                {
+                    var pos = Path[index].Item2;
+                    if (index < Path.Count - 1)
+                    {
+                        var Node = Path[index].Item1;
+                        Node.Q[pos] = (1 - LearningRateQTable) * Node.Q[pos] + Lambdas[lambdaPos--] * LearningRateQTable * (board.Score_UCT / Node.ActionsLength * Node.CurrentPlayer + Path[index + 1].Item1.U[Path[index + 1].Item2]);
+                    }
+                }
+            }
+        }
+        #endregion
+        #region 一些基础方法
+        /// <summary>
+        /// 搜索树搜索缓存
+        /// </summary>
+        private static readonly Dictionary<IndexUCT, TreeNode> Cache;
+        /// <summary>
+        /// 自对弈训练路径
+        /// </summary>
+        private static readonly List<(TreeNode, int)> SelfPlay_GamePath;
+        /// <summary>
+        /// 最大搜索深度
+        /// </summary>
+        private static readonly int MaxiumLength;
+        /// <summary>
+        /// 可以认输的步骤
+        /// </summary>
+        private static readonly int StepResign;
+        /// <summary>
+        /// 衰减率
+        /// </summary>
+        private static readonly List<float> Lambdas;
+        public static int WorkerCount { get; set; }
+        /// <summary>
+        /// UCT搜索初始化
+        /// </summary>
+        static QUCTSearch()
+        {
+            Cache = new Dictionary<IndexUCT, TreeNode>();
+            SelfPlay_GamePath = new List<(TreeNode, int)>();
+            MaxiumLength = (int)(PURE_BOARD_MAX * 1.5f);
+            StepResign = (int)(PURE_BOARD_MAX / 1.5f);
+            Lambdas = new List<float>(new float[PURE_BOARD_MAX]);
+            for (int i = Lambdas.Count - 1; i >= 0; i--)
+                Lambdas[i] = (float)Pow(lambdaSarsa, (Lambdas.Count - 1 - i));
+            SimulateRunEnable = false;
+            WorkerCount = 12;
+            ThreadPool.SetMaxThreads(WorkerCount, WorkerCount);
+        }
+        /// <summary>
+        /// 添加一个节点（共用缓存是互斥事件）
+        /// </summary>
+        /// <param name="board">当前盘面</param>
+        /// <returns>该树节点信息</returns>
+        private static TreeNode AddNode(IBoardUCT board)
+        {
+            TreeNode treeNode = null;
+            lock (Cache)
+            {
+                if (Cache.ContainsKey(board.SHA256HASH))
+                {
+                    treeNode = Cache[board.SHA256HASH];
+                }
+                else
+                {
+                    treeNode = new TreeNode(board);
+                    Cache.Add(treeNode.SHA256HASH, treeNode);
+                }
+            }
+            if (treeNode != null)
+                treeNode.UpdateU(Cpuct);
+            return treeNode;
+        }
+        /// <summary>
+        /// 清空缓存
+        /// </summary>
+        private static void ClearCache()
+        {
+            Cache.Clear();
+        }
+        #endregion
+    }
+}

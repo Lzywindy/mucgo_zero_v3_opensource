@@ -38,3 +38,10 @@ packages
 *ipch*
 *lnk*
 obj
+Properties
+Debug
+Release
+*.CNN
+*.ResNet
+*.UNet
+gnugo*
