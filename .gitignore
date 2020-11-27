@@ -6,9 +6,6 @@
 *.user
 *.userosscache
 *.sln.docstates
-*_i.c
-*_p.c
-*_i.h
 *.ilk
 *.meta
 *.obj
@@ -30,3 +27,4 @@
 *.pidb
 *.svclog
 *.scc
+*.cache
